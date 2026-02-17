@@ -1,0 +1,87 @@
+// Anomalous Sign-in Events Detection (Microsoft Sentinel / Entra ID)
+// Technique:
+// 1) Build a 14-day per-user baseline for sign-in count, countries, IPs, and apps.
+// 2) Compare the last 24 hours against that baseline.
+// 3) Score anomalies for unusual volume, first-seen country/IP/app, and high-risk sign-ins.
+
+let baselineWindow = 14d;
+let detectionWindow = 1d;
+let baseline =
+    SigninLogs
+    | where TimeGenerated between (ago(baselineWindow + detectionWindow) .. ago(detectionWindow))
+    | where ResultType == 0
+    | summarize
+        baseline_signins = count(),
+        baseline_distinct_ips = dcount(IPAddress),
+        baseline_distinct_countries = dcount(LocationDetails.countryOrRegion),
+        known_countries = make_set(LocationDetails.countryOrRegion, 512),
+        known_ips = make_set(IPAddress, 2048),
+        known_apps = make_set(AppDisplayName, 512)
+      by UserPrincipalName;
+
+SigninLogs
+| where TimeGenerated >= ago(detectionWindow)
+| where ResultType == 0
+| extend
+    Country = tostring(LocationDetails.countryOrRegion),
+    City = tostring(LocationDetails.city),
+    State = tostring(LocationDetails.state),
+    RiskLevel = tostring(RiskLevelDuringSignIn)
+| summarize
+    recent_signins = count(),
+    recent_distinct_ips = dcount(IPAddress),
+    recent_distinct_countries = dcount(Country),
+    first_seen = min(TimeGenerated),
+    last_seen = max(TimeGenerated),
+    recent_countries = make_set(Country, 128),
+    recent_ips = make_set(IPAddress, 512),
+    recent_apps = make_set(AppDisplayName, 128),
+    mfa_denied_events = countif(Status.errorCode == 50074 or Status.errorCode == 50076),
+    risky_events = countif(RiskLevel in ("high", "medium"))
+  by UserPrincipalName
+| join kind=leftouter baseline on UserPrincipalName
+| extend
+    baseline_signins = coalesce(baseline_signins, 0),
+    known_countries = coalesce(known_countries, dynamic([])),
+    known_ips = coalesce(known_ips, dynamic([])),
+    known_apps = coalesce(known_apps, dynamic([]))
+| mv-expand recent_country = recent_countries to typeof(string)
+| summarize
+    recent_signins = any(recent_signins),
+    recent_distinct_ips = any(recent_distinct_ips),
+    recent_distinct_countries = any(recent_distinct_countries),
+    first_seen = any(first_seen),
+    last_seen = any(last_seen),
+    recent_ips = any(recent_ips),
+    recent_apps = any(recent_apps),
+    mfa_denied_events = any(mfa_denied_events),
+    risky_events = any(risky_events),
+    baseline_signins = any(baseline_signins),
+    new_country_count = countif(recent_country !in (known_countries))
+  by UserPrincipalName
+| extend
+    expected_daily = baseline_signins / 14.0,
+    volume_spike_ratio = iif(expected_daily > 0, todouble(recent_signins) / expected_daily, todouble(recent_signins)),
+    anomaly_score =
+        35 * iif(volume_spike_ratio >= 3, 1.0, volume_spike_ratio / 3.0) +
+        20 * iif(new_country_count > 0, 1.0, 0.0) +
+        20 * iif(recent_distinct_ips >= 5, 1.0, todouble(recent_distinct_ips) / 5.0) +
+        15 * iif(risky_events > 0, 1.0, 0.0) +
+        10 * iif(mfa_denied_events > 0, 1.0, 0.0)
+| where anomaly_score >= 45
+| project
+    UserPrincipalName,
+    first_seen,
+    last_seen,
+    recent_signins,
+    baseline_signins,
+    volume_spike_ratio = round(volume_spike_ratio, 2),
+    recent_distinct_ips,
+    recent_distinct_countries,
+    new_country_count,
+    risky_events,
+    mfa_denied_events,
+    anomaly_score = round(anomaly_score, 1),
+    recent_ips,
+    recent_apps
+| order by anomaly_score desc, recent_signins desc
