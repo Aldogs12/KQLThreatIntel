@@ -1,0 +1,91 @@
+// Fake Google Forms Job Scam - Small & Simple KQL Hunt Queries
+// Target data: Microsoft Sentinel / Entra ID (SigninLogs, UrlClickEvents, OfficeActivity)
+
+// -----------------------------------------------------------------------------
+// Query 1: Users who clicked known phishing domains in the last 30 days
+// -----------------------------------------------------------------------------
+let lookback = 30d;
+let badDomains = dynamic(["forms.google.ss-o.com", "id-v4.com"]);
+UrlClickEvents
+| where TimeGenerated >= ago(lookback)
+| where ActionType == "ClickAllowed"
+| extend UrlHost = tostring(parse_url(Url).Host)
+| where UrlHost has_any (badDomains)
+| project TimeGenerated, AccountUpn, Url, UrlHost, NetworkMessageId
+| order by TimeGenerated desc
+
+// -----------------------------------------------------------------------------
+// Query 2: Sign-ins after suspicious URL click (possible credential theft)
+// -----------------------------------------------------------------------------
+let lookback = 30d;
+let badDomains = dynamic(["forms.google.ss-o.com", "id-v4.com"]);
+let suspiciousClicks =
+    UrlClickEvents
+    | where TimeGenerated >= ago(lookback)
+    | extend UrlHost = tostring(parse_url(Url).Host)
+    | where UrlHost has_any (badDomains)
+    | project ClickTime = TimeGenerated, AccountUpn;
+SigninLogs
+| where TimeGenerated >= ago(lookback)
+| where ResultType == 0
+| join kind=inner suspiciousClicks on $left.UserPrincipalName == $right.AccountUpn
+| where TimeGenerated between (ClickTime .. ClickTime + 4h)
+| project UserPrincipalName, ClickTime, SigninTime = TimeGenerated, IPAddress, AppDisplayName, Location = tostring(LocationDetails.countryOrRegion)
+| order by SigninTime desc
+
+// -----------------------------------------------------------------------------
+// Query 3: New country sign-ins in last 7 days vs previous 30 days baseline
+// -----------------------------------------------------------------------------
+let recent = 7d;
+let baseline = 30d;
+let baselineCountries =
+    SigninLogs
+    | where TimeGenerated between (ago(recent + baseline) .. ago(recent))
+    | where ResultType == 0
+    | summarize knownCountries = make_set(tostring(LocationDetails.countryOrRegion), 256) by UserPrincipalName;
+SigninLogs
+| where TimeGenerated >= ago(recent)
+| where ResultType == 0
+| extend Country = tostring(LocationDetails.countryOrRegion)
+| join kind=leftouter baselineCountries on UserPrincipalName
+| where Country !in (knownCountries)
+| project TimeGenerated, UserPrincipalName, IPAddress, Country, AppDisplayName
+| order by TimeGenerated desc
+
+// -----------------------------------------------------------------------------
+// Query 4: Impossible travel (same user, far countries, short time)
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated >= ago(7d)
+| where ResultType == 0
+| extend Country = tostring(LocationDetails.countryOrRegion)
+| where isnotempty(Country)
+| sort by UserPrincipalName asc, TimeGenerated asc
+| serialize
+| extend PrevUser = prev(UserPrincipalName), PrevTime = prev(TimeGenerated), PrevCountry = prev(Country)
+| where UserPrincipalName == PrevUser and Country != PrevCountry
+| extend MinutesBetween = datetime_diff("minute", TimeGenerated, PrevTime)
+| where MinutesBetween between (0 .. 240)
+| project UserPrincipalName, PrevTime, PrevCountry, TimeGenerated, Country, MinutesBetween, IPAddress
+| order by TimeGenerated desc
+
+// -----------------------------------------------------------------------------
+// Query 5: Suspicious mailbox forwarding rules (post-compromise behavior)
+// -----------------------------------------------------------------------------
+OfficeActivity
+| where TimeGenerated >= ago(30d)
+| where Workload == "Exchange"
+| where Operation in ("New-InboxRule", "Set-InboxRule")
+| where Parameters has "Forward" or Parameters has "Redirect"
+| project TimeGenerated, UserId, Operation, ClientIP, Parameters
+| order by TimeGenerated desc
+
+// -----------------------------------------------------------------------------
+// Query 6: Recently added MFA methods/devices
+// -----------------------------------------------------------------------------
+AuditLogs
+| where TimeGenerated >= ago(30d)
+| where OperationName has_any ("Update user", "Change user", "Register security info")
+| where TargetResources has "Authentication" or TargetResources has "MFA" or ResultReason has "security info"
+| project TimeGenerated, OperationName, InitiatedBy, TargetResources, Result, ResultReason
+| order by TimeGenerated desc
